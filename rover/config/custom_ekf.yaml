@@ -1,0 +1,12 @@
+#custom_ekf.yaml
+custom_ekf:
+  ros__parameters:
+    frequency: 50.0
+    imu_timeout: 0.25
+    wheel_position_std: 0.05
+    gyro_z_std: 0.01
+    gyro_bias_std: 0.0001
+    initial_yaw: 0.0
+    publish_tf: true
+    odom_frame: odom
+    base_frame: base_link
