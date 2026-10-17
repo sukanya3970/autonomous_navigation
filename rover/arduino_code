@@ -1,0 +1,1605 @@
+// ============================================================================
+// ROBO 1.0 — CMD_VEL ROVER CONTROLLER  (v2, fixed)
+// ----------------------------------------------------------------------------
+// Arduino Mega 2560
+//
+// COMMAND FROM ROS2 BRIDGE
+//
+//     V <linear_velocity_mps> <angular_velocity_rad_s>
+//
+// Pipeline:
+//     cmd_vel (v,w) -> differential drive -> wheel velocity -> wheel RPM
+//     -> feed-forward PWM (calibration table) + encoder PID correction
+//
+// TELEMETRY
+//     D,timestamp,LR,RR,yaw,pitch,roll,gyroX,gyroY,gyroZ,accelX,accelY,accelZ
+//
+// OPTIONAL PID DEBUG (DEBUG_PID = 1), every 100 ms:
+//     T,targetRF,measRF,pwmRF,targetLF,measLF,pwmLF     (velocities in m/s)
+//     -> make sure your Python bridge ignores lines starting with "T,"
+//
+// SERIAL
+//     USB Serial : 115200
+//     Serial3    : 9600
+//
+// SAFETY
+//     Watchdog: 300 ms (bridge must send V at >= ~5 Hz)
+//     Zero command: active brake
+//
+// CHANGES vs v1
+//     1. Watchdog really is 300 ms now (was 5000).
+//     2. setCmdVel() only rewrites motor PWM when the target changes, so
+//        repeated V commands no longer overwrite the PID output with pure FF.
+//     3. Wheel clamp scales both sides together (keeps turn radius).
+//     4. MAX_WHEEL_RPM raised to 50 (calibration table reaches ~58 RPM).
+//     5. PID gains raised (Kp 120, Ki 250) to match the FF slope.
+//     6. Rotation torque floor no longer pins PWM: boost only for the first
+//        400 ms, afterwards the floor applies only to wheels that are stalled.
+//     7. PID cannot reverse the wheel or drop below the motor deadband.
+//     8. PID integrators survive small target changes (only reset on
+//        start / direction flip).
+//     9. PID timing re-initialised after a watchdog timeout.
+//    10. CMDVEL debug print only on target change.
+//    11. Strict number parsing + proper handling of over-long lines.
+// ============================================================================
+
+
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BNO055.h>
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+
+#define DEBUG_PID 1
+
+
+// ============================================================================
+// MOTOR PINS
+// ============================================================================
+
+// RF = Right Front
+#define RF_REN  23
+#define RF_LEN  22
+#define RF_RPWM 2
+#define RF_LPWM 3
+
+// LF = Left Front
+#define LF_REN  24
+#define LF_LEN  25
+#define LF_RPWM 4
+#define LF_LPWM 5
+
+// LR = Left Rear
+#define LR_REN  26
+#define LR_LEN  27
+#define LR_RPWM 6
+#define LR_LPWM 7
+
+// RR = Right Rear
+#define RR_REN  28
+#define RR_LEN  29
+#define RR_RPWM 10
+#define RR_LPWM 11
+
+
+// ============================================================================
+// MOTOR DIRECTION
+// ============================================================================
+// Positive LOGICAL velocity = rover forward.
+
+const bool RF_INVERTED = true;
+const bool LF_INVERTED = false;
+const bool LR_INVERTED = false;
+const bool RR_INVERTED = true;
+
+
+// ============================================================================
+// ENCODER PINS (Mega Port K: A8..A15 = PK0..PK7)\n// ONLY A12-A15 (LR/RR) are active; A8-A11 (RF/LF) are disabled.
+// ============================================================================
+
+#define RF_A_BIT 0
+#define RF_B_BIT 1
+
+#define LF_A_BIT 2
+#define LF_B_BIT 3
+
+#define LR_A_BIT 4
+#define LR_B_BIT 5
+
+#define RR_A_BIT 6
+#define RR_B_BIT 7
+
+
+// ============================================================================
+// ENCODER LOGICAL SIGN
+// ============================================================================
+// Signs are applied HERE. The ROS/Python parser must NOT apply them again.
+
+const int RF_ENCODER_SIGN = +1;
+const int LF_ENCODER_SIGN = -1;
+const int LR_ENCODER_SIGN = -1;
+const int RR_ENCODER_SIGN = +1;
+
+
+// ============================================================================
+// ROBOT CONSTANTS
+// ============================================================================
+
+const float ENCODER_CPR = 4096.0;
+const float GEAR_RATIO  = 3.6;
+
+// Keep equal to the value used during calibration.
+const float WHEEL_CIRC  = 0.32;
+
+// Distance between left and right wheel centers.
+const float TRACK_WIDTH = 0.55;
+
+
+// ============================================================================
+// VELOCITY LIMIT
+// ============================================================================
+// Calibration table goes up to ~58 RPM (0.33 m/s). Lower this if you want a
+// deliberate safety limit.
+
+const float MAX_WHEEL_RPM = 60.0;
+
+// Torque floor used in in-place rotation (see applyLowSpeedTorqueSupport).
+const int LOW_SPEED_PWM_FLOOR = 100;
+
+// Temporary torque boost when starting an in-place rotation.
+const int ROTATION_START_PWM = 60;
+const unsigned long ROTATION_START_BOOST_MS = 0UL;
+
+// A wheel slower than this (m/s) while commanded is treated as stalled.
+const float STICTION_VELOCITY = 0.02;
+
+
+// ============================================================================
+// PWM LIMITS
+// ============================================================================
+
+const int MAX_PWM = 180;
+const int MIN_PWM = 30;
+
+
+// ============================================================================
+// WATCHDOG
+// ============================================================================
+
+const unsigned long CMD_TIMEOUT_MS = 1000UL;
+
+
+// ============================================================================
+// TELEMETRY / IMU TIMING
+// ============================================================================
+
+const unsigned long TELEMETRY_INTERVAL_MS = 20UL;
+const unsigned long IMU_INTERVAL_MS       = 50UL;
+
+// Drop to 100000 if you see IMU freezes.
+const unsigned long I2C_CLOCK_HZ = 400000UL;
+
+
+// ============================================================================
+// IMU
+// ============================================================================
+// BNO055 heading is clockwise-positive; ROS wants CCW-positive.
+// Rotate the robot CCW by hand: if yaw decreases, set IMU_YAW_SIGN = -1.0.
+
+const float IMU_YAW_OFFSET = 180.0;
+const float IMU_YAW_SIGN   = 1.0;
+
+
+// ============================================================================
+// ENCODER STATE
+// ============================================================================
+
+// Front encoder counters are retained only for source compatibility but are NOT
+// read, updated, or reported. Only rear encoders are used.
+volatile long rfCount = 0;
+volatile long lfCount = 0;
+volatile long lrCount = 0;
+volatile long rrCount = 0;
+
+volatile uint8_t rfPrev = 0;
+volatile uint8_t lfPrev = 0;
+volatile uint8_t lrPrev = 0;
+volatile uint8_t rrPrev = 0;
+
+
+// ============================================================================
+// QUADRATURE LOOKUP
+// ============================================================================
+
+const int8_t quadTable[16] =
+{
+     0, -1,  1,  0,
+     1,  0,  0, -1,
+    -1,  0,  0,  1,
+     0,  1, -1,  0
+};
+
+
+uint8_t encoderState(uint8_t portValue, uint8_t bitA, uint8_t bitB)
+{
+    return (((portValue >> bitA) & 1) << 1) |
+           ((portValue >> bitB) & 1);
+}
+
+
+// ============================================================================
+// MOTOR SETUP
+// ============================================================================
+
+void setupMotors()
+{
+    pinMode(RF_REN, OUTPUT);
+    pinMode(RF_LEN, OUTPUT);
+    pinMode(RF_RPWM, OUTPUT);
+    pinMode(RF_LPWM, OUTPUT);
+
+    pinMode(LF_REN, OUTPUT);
+    pinMode(LF_LEN, OUTPUT);
+    pinMode(LF_RPWM, OUTPUT);
+    pinMode(LF_LPWM, OUTPUT);
+
+    pinMode(LR_REN, OUTPUT);
+    pinMode(LR_LEN, OUTPUT);
+    pinMode(LR_RPWM, OUTPUT);
+    pinMode(LR_LPWM, OUTPUT);
+
+    pinMode(RR_REN, OUTPUT);
+    pinMode(RR_LEN, OUTPUT);
+    pinMode(RR_RPWM, OUTPUT);
+    pinMode(RR_LPWM, OUTPUT);
+
+    // FRONT MOTORS DISABLED: RF/LF are never driven.
+    digitalWrite(RF_REN, LOW);
+    digitalWrite(RF_LEN, LOW);
+    digitalWrite(LF_REN, LOW);
+    digitalWrite(LF_LEN, LOW);
+
+    digitalWrite(LR_REN, HIGH);
+    digitalWrite(LR_LEN, HIGH);
+
+    digitalWrite(RR_REN, HIGH);
+    digitalWrite(RR_LEN, HIGH);
+
+    analogWrite(RF_RPWM, 0);
+    analogWrite(RF_LPWM, 0);
+
+    analogWrite(LF_RPWM, 0);
+    analogWrite(LF_LPWM, 0);
+
+    analogWrite(LR_RPWM, 0);
+    analogWrite(LR_LPWM, 0);
+
+    analogWrite(RR_RPWM, 0);
+    analogWrite(RR_LPWM, 0);
+}
+
+
+// ============================================================================
+// ENCODERS
+// ============================================================================
+
+void syncEncoderStates()
+{
+    uint8_t k = PINK;
+
+    noInterrupts();
+
+    // ONLY REAR ENCODERS ARE USED.
+    lrPrev = encoderState(k, LR_A_BIT, LR_B_BIT);
+    rrPrev = encoderState(k, RR_A_BIT, RR_B_BIT);
+
+    interrupts();
+}
+
+
+ISR(PCINT2_vect)
+{
+    uint8_t k = PINK;
+
+    // ONLY REAR ENCODERS ARE COUNTED.
+    uint8_t lrNow = encoderState(k, LR_A_BIT, LR_B_BIT);
+    uint8_t rrNow = encoderState(k, RR_A_BIT, RR_B_BIT);
+
+    lrCount += quadTable[(lrPrev << 2) | lrNow];
+    rrCount += quadTable[(rrPrev << 2) | rrNow];
+
+    lrPrev = lrNow;
+    rrPrev = rrNow;
+}
+
+
+long readCount(volatile long &counter)
+{
+    noInterrupts();
+    long value = counter;
+    interrupts();
+    return value;
+}
+
+
+// Front encoder reads are intentionally disabled.
+long readRFEncoder() { return 0; }
+long readLFEncoder() { return 0; }
+long readLREncoder() { return LR_ENCODER_SIGN * readCount(lrCount); }
+long readRREncoder() { return RR_ENCODER_SIGN * readCount(rrCount); }
+
+
+void resetEncoders()
+{
+    noInterrupts();
+
+    // Only rear encoder counters are active.
+    lrCount = 0;
+    rrCount = 0;
+
+    interrupts();
+
+    syncEncoderStates();
+}
+
+
+void setupEncoders()
+{
+    // Only rear encoder inputs are required:
+    // LR = A12/A13, RR = A14/A15.
+    pinMode(A12, INPUT_PULLUP);
+    pinMode(A13, INPUT_PULLUP);
+    pinMode(A14, INPUT_PULLUP);
+    pinMode(A15, INPUT_PULLUP);
+
+    syncEncoderStates();
+
+    PCICR &= ~(1 << PCIE2);
+    PCMSK2 = 0xF0;  // A12-A15 only: LR/RR encoders
+    PCIFR |= (1 << PCIF2);
+    PCICR |= (1 << PCIE2);
+}
+
+
+// ============================================================================
+// BNO055
+// ============================================================================
+
+Adafruit_BNO055 bno(55, 0x28);
+
+bool imuOK = false;
+
+float imuYaw   = 0.0;
+float imuPitch = 0.0;
+float imuRoll  = 0.0;
+
+float gyroX = 0.0;
+float gyroY = 0.0;
+float gyroZ = 0.0;
+
+float accelX = 0.0;
+float accelY = 0.0;
+float accelZ = 0.0;
+
+float imuReferenceYaw = 0.0;
+bool imuReferenceSet = false;
+
+unsigned long lastIMUUpdate = 0;
+
+
+float normalize180(float angle)
+{
+    while (angle > 180.0)
+        angle -= 360.0;
+
+    while (angle <= -180.0)
+        angle += 360.0;
+
+    return angle;
+}
+
+
+void readIMU()
+{
+    if (!imuOK)
+        return;
+
+    sensors_event_t orientationEvent;
+    sensors_event_t gyroEvent;
+    sensors_event_t accelEvent;
+
+    bno.getEvent(&orientationEvent, Adafruit_BNO055::VECTOR_EULER);
+    bno.getEvent(&gyroEvent,        Adafruit_BNO055::VECTOR_GYROSCOPE);
+    bno.getEvent(&accelEvent,       Adafruit_BNO055::VECTOR_LINEARACCEL);
+
+    float rawYaw = orientationEvent.orientation.x;
+
+    float correctedYaw = normalize180(rawYaw + IMU_YAW_OFFSET);
+    correctedYaw *= IMU_YAW_SIGN;
+    correctedYaw = normalize180(correctedYaw);
+
+    if (!imuReferenceSet)
+    {
+        imuReferenceYaw = correctedYaw;
+        imuReferenceSet = true;
+    }
+
+    imuYaw = normalize180(correctedYaw - imuReferenceYaw);
+
+    imuPitch = orientationEvent.orientation.y;
+    imuRoll  = orientationEvent.orientation.z;
+
+    gyroX = gyroEvent.gyro.x;
+    gyroY = gyroEvent.gyro.y;
+    gyroZ = gyroEvent.gyro.z;
+
+    accelX = accelEvent.acceleration.x;
+    accelY = accelEvent.acceleration.y;
+    accelZ = accelEvent.acceleration.z;
+}
+
+
+// ============================================================================
+// MOTOR COMMAND STATE
+// ============================================================================
+
+// Desired wheel RPM after cmd_vel conversion.
+float targetRF_RPM = 0.0;
+float targetLF_RPM = 0.0;
+float targetLR_RPM = 0.0;
+float targetRR_RPM = 0.0;
+
+// PWM actually sent to motors.
+int desiredPWM_RF = 0;
+int desiredPWM_LF = 0;
+int desiredPWM_LR = 0;
+int desiredPWM_RR = 0;
+
+// Last measured wheel velocities (m/s), updated by the PID loop.
+float measVelRF = 0.0;
+float measVelLF = 0.0;
+float measVelLR = 0.0;
+float measVelRR = 0.0;
+
+float currentV = 0.0;
+float currentW = 0.0;
+
+bool manualStop = false;
+bool manualPWMMode = false;
+
+bool rotationMode = false;
+unsigned long rotationBoostUntil = 0;
+
+unsigned long lastCmdTime = 0;
+
+
+// ============================================================================
+// WHEEL VELOCITY PID
+// ============================================================================
+//
+// Feed-forward gives the base PWM, PID corrects using encoder feedback.
+// PID works in m/s. Control rate: 20 Hz.
+//
+// Starting gains - tune from here using the DEBUG_PID output.
+//   Calibration slope is ~144 PWM per (m/s), so Kp of that order is sensible.
+//   Ki*I is limited to Ki * PID_INTEGRAL_LIMIT = 75 PWM.
+//
+// Integrators are reset only on start-from-stop or direction flip.
+//
+// ============================================================================
+
+const unsigned long PID_INTERVAL_MS = 50UL;
+
+const float PID_KP = 120.0;
+const float PID_KI = 250.0;
+const float PID_KD = 0.0;
+
+const float PID_INTEGRAL_LIMIT   = 0.3;
+const float PID_CORRECTION_LIMIT = 80.0;
+
+float pidIntegralRF = 0.0;
+float pidIntegralLF = 0.0;
+float pidIntegralLR = 0.0;
+float pidIntegralRR = 0.0;
+
+float pidPreviousErrorRF = 0.0;
+float pidPreviousErrorLF = 0.0;
+float pidPreviousErrorLR = 0.0;
+float pidPreviousErrorRR = 0.0;
+
+unsigned long lastPIDUpdate = 0;
+long previousRFCount = 0;
+long previousLFCount = 0;
+long previousLRCount = 0;
+long previousRRCount = 0;
+bool pidMeasurementInitialized = false;
+
+void resetWheelPID(float &integral, float &previousError)
+{
+    integral = 0.0;
+    previousError = 0.0;
+}
+
+void resetAllWheelPID()
+{
+    resetWheelPID(pidIntegralRF, pidPreviousErrorRF);
+    resetWheelPID(pidIntegralLF, pidPreviousErrorLF);
+    resetWheelPID(pidIntegralLR, pidPreviousErrorLR);
+    resetWheelPID(pidIntegralRR, pidPreviousErrorRR);
+}
+
+float runWheelPID(
+    float &integral,
+    float &previousError,
+    float targetVelocity,
+    float actualVelocity,
+    float dt
+)
+{
+    if (fabs(targetVelocity) < 0.001)
+    {
+        resetWheelPID(integral, previousError);
+        return 0.0;
+    }
+
+    float error = targetVelocity - actualVelocity;
+
+    integral += error * dt;
+    integral = constrain(integral, -PID_INTEGRAL_LIMIT, PID_INTEGRAL_LIMIT);
+
+    float derivative = 0.0;
+
+    if (dt > 0.0001)
+    {
+        derivative = (error - previousError) / dt;
+    }
+
+    previousError = error;
+
+    float correction =
+        PID_KP * error +
+        PID_KI * integral +
+        PID_KD * derivative;
+
+    return constrain(correction, -PID_CORRECTION_LIMIT, PID_CORRECTION_LIMIT);
+}
+
+float rpmToVelocity(float rpm)
+{
+    return rpm * WHEEL_CIRC / 60.0;
+}
+
+float countsToRPM(long deltaCounts, float dt)
+{
+    if (dt <= 0.0001)
+        return 0.0;
+
+    const float countsPerWheelRevolution = ENCODER_CPR * GEAR_RATIO;
+
+    return (((float)deltaCounts / dt) / countsPerWheelRevolution) * 60.0;
+}
+
+void initializePIDMeasurement()
+{
+    // ONLY REAR ENCODERS ARE USED FOR FEEDBACK.
+    previousLRCount = readLREncoder();
+    previousRRCount = readRREncoder();
+
+    lastPIDUpdate = millis();
+    pidMeasurementInitialized = true;
+}
+
+
+// ============================================================================
+// CALIBRATED VELOCITY -> PWM TABLE (feed-forward only)
+// ============================================================================
+
+const int FF_POINTS = 16;
+
+const float ffVelocity[FF_POINTS] =
+{
+    0.122, 0.144, 0.183, 0.198,
+    0.212, 0.215, 0.232, 0.255,
+    0.267, 0.278, 0.287, 0.294,
+    0.301, 0.306, 0.328, 0.330
+};
+
+const int ffPWM[FF_POINTS] =
+{
+    30, 32, 34, 36,
+    38, 40, 42, 44,
+    46, 48, 50, 52,
+    54, 56, 58, 60
+};
+
+
+int velocityToPWM(float velocity)
+{
+    float magnitude = fabs(velocity);
+
+    if (magnitude < 0.001)
+        return 0;
+
+    // Below calibrated minimum: PWM 30 is the minimum useful command.
+    if (magnitude <= ffVelocity[0])
+        return MIN_PWM;
+
+    // Above calibration range: use last calibration point.
+    if (magnitude >= ffVelocity[FF_POINTS - 1])
+        return ffPWM[FF_POINTS - 1];
+
+    for (int i = 0; i < FF_POINTS - 1; i++)
+    {
+        if (magnitude >= ffVelocity[i] && magnitude <= ffVelocity[i + 1])
+        {
+            float v1 = ffVelocity[i];
+            float v2 = ffVelocity[i + 1];
+
+            float p1 = ffPWM[i];
+            float p2 = ffPWM[i + 1];
+
+            float ratio = (magnitude - v1) / (v2 - v1);
+            float pwm = p1 + ratio * (p2 - p1);
+
+            return constrain((int)round(pwm), MIN_PWM, MAX_PWM);
+        }
+    }
+
+    return MIN_PWM;
+}
+
+
+// ============================================================================
+// MOTOR OUTPUT
+// ============================================================================
+
+void driveMotorPWM(
+    uint8_t ren,
+    uint8_t len,
+    uint8_t rpwm,
+    uint8_t lpwm,
+    int pwmSigned,
+    bool inverted
+)
+{
+    int pwm = constrain(pwmSigned, -MAX_PWM, MAX_PWM);
+
+    // ZERO = ACTIVE BRAKE
+    if (pwm == 0)
+    {
+        analogWrite(rpwm, 0);
+        analogWrite(lpwm, 0);
+
+        digitalWrite(ren, HIGH);
+        digitalWrite(len, HIGH);
+
+        return;
+    }
+
+    bool forward = pwm > 0;
+
+    if (inverted)
+        forward = !forward;
+
+    digitalWrite(ren, HIGH);
+    digitalWrite(len, HIGH);
+
+    int magnitude = abs(pwm);
+
+    if (forward)
+    {
+        analogWrite(rpwm, magnitude);
+        analogWrite(lpwm, 0);
+    }
+    else
+    {
+        analogWrite(rpwm, 0);
+        analogWrite(lpwm, magnitude);
+    }
+}
+
+
+void brakeMotor(uint8_t ren, uint8_t len, uint8_t rpwm, uint8_t lpwm)
+{
+    analogWrite(rpwm, 0);
+    analogWrite(lpwm, 0);
+
+    digitalWrite(ren, HIGH);
+    digitalWrite(len, HIGH);
+}
+
+
+void brakeAllMotors()
+{
+    brakeMotor(RF_REN, RF_LEN, RF_RPWM, RF_LPWM);
+    brakeMotor(LF_REN, LF_LEN, LF_RPWM, LF_LPWM);
+    brakeMotor(LR_REN, LR_LEN, LR_RPWM, LR_LPWM);
+    brakeMotor(RR_REN, RR_LEN, RR_RPWM, RR_LPWM);
+}
+
+
+void applyMotorOutputs()
+{
+    // FRONT MOTORS PERMANENTLY SHUT DOWN.
+    brakeMotor(RF_REN, RF_LEN, RF_RPWM, RF_LPWM);
+    brakeMotor(LF_REN, LF_LEN, LF_RPWM, LF_LPWM);
+
+    // ONLY REAR MOTORS RECEIVE commands.
+    driveMotorPWM(LR_REN, LR_LEN, LR_RPWM, LR_LPWM, desiredPWM_LR, LR_INVERTED);
+    driveMotorPWM(RR_REN, RR_LEN, RR_RPWM, RR_LPWM, desiredPWM_RR, RR_INVERTED);
+}
+
+
+// ============================================================================
+// HELPERS
+// ============================================================================
+
+int signOf(float x)
+{
+    if (x > 0.0) return 1;
+    if (x < 0.0) return -1;
+    return 0;
+}
+
+bool allTargetsZero()
+{
+    return fabs(targetRF_RPM) < 0.001 &&
+           fabs(targetLF_RPM) < 0.001 &&
+           fabs(targetLR_RPM) < 0.001 &&
+           fabs(targetRR_RPM) < 0.001;
+}
+
+void clearMeasuredVelocities()
+{
+    measVelRF = 0.0;
+    measVelLF = 0.0;
+    measVelLR = 0.0;
+    measVelRR = 0.0;
+}
+
+// Keeps PWM in the target's direction and above the motor deadband.
+int finalizeWheelPWM(int pwm, float targetRPM)
+{
+    int dir = signOf(targetRPM);
+
+    if (dir == 0)
+        return 0;
+
+    int magnitude = (pwm * dir > 0) ? abs(pwm) : 0;
+
+    magnitude = constrain(magnitude, MIN_PWM, MAX_PWM);
+
+    return dir * magnitude;
+}
+
+// Raises |pwm| to at least floorPWM, in the direction of the target.
+int applyWheelFloor(int pwm, float targetRPM, int floorPWM)
+{
+    int dir = signOf(targetRPM);
+
+    if (dir == 0)
+        return 0;
+
+    int magnitude = max(abs(pwm), floorPWM);
+
+    magnitude = constrain(magnitude, 0, MAX_PWM);
+
+    return dir * magnitude;
+}
+
+
+// ============================================================================
+// FEED-FORWARD PWM FROM TARGETS
+// ============================================================================
+
+void updateWheelPWM()
+{
+    desiredPWM_RF = velocityToPWM(rpmToVelocity(targetRF_RPM));
+    desiredPWM_LF = velocityToPWM(rpmToVelocity(targetLF_RPM));
+    desiredPWM_LR = velocityToPWM(rpmToVelocity(targetLR_RPM));
+    desiredPWM_RR = velocityToPWM(rpmToVelocity(targetRR_RPM));
+
+    // Restore direction.
+    if (targetRF_RPM < 0) desiredPWM_RF *= -1;
+    if (targetLF_RPM < 0) desiredPWM_LF *= -1;
+    if (targetLR_RPM < 0) desiredPWM_LR *= -1;
+    if (targetRR_RPM < 0) desiredPWM_RR *= -1;
+}
+
+
+// ============================================================================
+// LOW-SPEED TORQUE SUPPORT (in-place rotation only)
+// ============================================================================
+//
+// - First ROTATION_START_BOOST_MS: every wheel gets at least ROTATION_START_PWM
+//   to break stiction.
+// - Afterwards: the floor is applied ONLY to wheels that are commanded but
+//   have not started moving (|measured| < STICTION_VELOCITY). Once a wheel
+//   moves, the PID is in full control, so speed follows the commanded w.
+//
+// ============================================================================
+
+void applyLowSpeedTorqueSupport()
+{
+    if (!rotationMode)
+        return;
+
+    if (millis() < rotationBoostUntil)
+    {
+        desiredPWM_LR = applyWheelFloor(desiredPWM_LR, targetLR_RPM, ROTATION_START_PWM);
+        desiredPWM_RR = applyWheelFloor(desiredPWM_RR, targetRR_RPM, ROTATION_START_PWM);
+        return;
+    }
+
+    if (fabs(measVelLR) < STICTION_VELOCITY)
+        desiredPWM_LR = applyWheelFloor(desiredPWM_LR, targetLR_RPM, LOW_SPEED_PWM_FLOOR);
+
+    if (fabs(measVelRR) < STICTION_VELOCITY)
+        desiredPWM_RR = applyWheelFloor(desiredPWM_RR, targetRR_RPM, LOW_SPEED_PWM_FLOOR);
+}
+
+
+// ============================================================================
+// CLOSED-LOOP WHEEL VELOCITY CONTROL (20 Hz)
+// ============================================================================
+
+void updateWheelVelocityControl()
+{
+    // M commands are direct PWM commands.
+    if (manualPWMMode)
+        return;
+
+    unsigned long now = millis();
+
+    if (!pidMeasurementInitialized)
+    {
+        initializePIDMeasurement();
+        return;
+    }
+
+    if (now - lastPIDUpdate < PID_INTERVAL_MS)
+        return;
+
+    float dt = (now - lastPIDUpdate) / 1000.0;
+
+    lastPIDUpdate = now;
+
+    // ONLY REAR ENCODERS ARE READ.
+    long lrCountNow = readLREncoder();
+    long rrCountNow = readRREncoder();
+
+    long lrDelta = lrCountNow - previousLRCount;
+    long rrDelta = rrCountNow - previousRRCount;
+
+    previousLRCount = lrCountNow;
+    previousRRCount = rrCountNow;
+
+    measVelLR = rpmToVelocity(countsToRPM(lrDelta, dt));
+    measVelRR = rpmToVelocity(countsToRPM(rrDelta, dt));
+
+    // No wheel commanded: active brake, clear PID state.
+    if (allTargetsZero())
+    {
+        resetAllWheelPID();
+        desiredPWM_RF = 0;
+        desiredPWM_LF = 0;
+        desiredPWM_LR = 0;
+        desiredPWM_RR = 0;
+        brakeAllMotors();
+        return;
+    }
+
+    // Feed-forward base PWM.
+    updateWheelPWM();
+
+    // PID FEEDBACK ONLY FROM REAR WHEELS.
+    float lrCorrection = runWheelPID(
+        pidIntegralLR, pidPreviousErrorLR,
+        rpmToVelocity(targetLR_RPM), measVelLR, dt);
+
+    float rrCorrection = runWheelPID(
+        pidIntegralRR, pidPreviousErrorRR,
+        rpmToVelocity(targetRR_RPM), measVelRR, dt);
+
+    desiredPWM_LR = finalizeWheelPWM((int)round(desiredPWM_LR + lrCorrection), targetLR_RPM);
+    desiredPWM_RR = finalizeWheelPWM((int)round(desiredPWM_RR + rrCorrection), targetRR_RPM);
+
+    applyLowSpeedTorqueSupport();
+
+    applyMotorOutputs();
+
+#if DEBUG_PID
+    static unsigned long lastDebug = 0;
+
+    if (now - lastDebug >= 100UL)
+    {
+        lastDebug = now;
+
+        Serial.print("T,");
+        Serial.print(rpmToVelocity(targetLR_RPM), 3);
+        Serial.print(",");
+        Serial.print(measVelLR, 3);
+        Serial.print(",");
+        Serial.print(desiredPWM_LR);
+        Serial.print(",");
+        Serial.print(rpmToVelocity(targetRR_RPM), 3);
+        Serial.print(",");
+        Serial.print(measVelRR, 3);
+        Serial.print(",");
+        Serial.println(desiredPWM_RR);
+    }
+#endif
+}
+
+
+// ============================================================================
+// SET CMD_VEL
+// ============================================================================
+//
+//     left  = v - w*track/2
+//     right = v + w*track/2
+//
+// Motors are only re-commanded when the target changes. Repeated identical
+// V commands just refresh the watchdog and leave the PID output alone.
+//
+// ============================================================================
+
+void setCmdVel(float v, float w)
+{
+    lastCmdTime = millis();
+
+    bool wasManual = manualPWMMode;
+
+    // A V command always returns to closed-loop velocity mode.
+    manualPWMMode = false;
+
+    if (manualStop)
+        return;
+
+    currentV = v;
+    currentW = w;
+
+
+    // --------------------------------------------------------
+    // ZERO VELOCITY
+    // --------------------------------------------------------
+
+    if (fabs(v) < 0.001 && fabs(w) < 0.001)
+    {
+        targetRF_RPM = 0;
+        targetLF_RPM = 0;
+        targetLR_RPM = 0;
+        targetRR_RPM = 0;
+
+        rotationMode = false;
+        rotationBoostUntil = 0;
+
+        desiredPWM_RF = 0;
+        desiredPWM_LF = 0;
+        desiredPWM_LR = 0;
+        desiredPWM_RR = 0;
+
+        resetAllWheelPID();
+
+        brakeAllMotors();
+
+        return;
+    }
+
+
+    // --------------------------------------------------------
+    // DIFFERENTIAL DRIVE
+    // --------------------------------------------------------
+
+    float leftVelocity  = v - (w * TRACK_WIDTH * 0.5);
+    float rightVelocity = v + (w * TRACK_WIDTH * 0.5);
+
+    float leftRPM  = (leftVelocity  / WHEEL_CIRC) * 60.0;
+    float rightRPM = (rightVelocity / WHEEL_CIRC) * 60.0;
+
+
+    // --------------------------------------------------------
+    // RPM LIMIT - scale both sides together to keep curvature
+    // --------------------------------------------------------
+
+    float maxMag = max(fabs(leftRPM), fabs(rightRPM));
+
+    if (maxMag > MAX_WHEEL_RPM)
+    {
+        float scale = MAX_WHEEL_RPM / maxMag;
+
+        leftRPM  *= scale;
+        rightRPM *= scale;
+    }
+
+
+    // --------------------------------------------------------
+    // CHANGE DETECTION
+    // --------------------------------------------------------
+
+    bool wasStopped = allTargetsZero();
+
+    bool targetChanged =
+        fabs(targetRR_RPM - rightRPM) > 0.01 ||
+        fabs(targetLR_RPM - leftRPM)  > 0.01;
+
+    bool directionFlip =
+        signOf(targetRR_RPM) != signOf(rightRPM) ||
+        signOf(targetLR_RPM) != signOf(leftRPM);
+
+    bool newRotationMode = (fabs(v) < 0.01 && fabs(w) > 0.01);
+
+    bool rotationChanged = (newRotationMode != rotationMode);
+
+    if (newRotationMode && !rotationMode)
+        rotationBoostUntil = millis() + ROTATION_START_BOOST_MS;
+
+    rotationMode = newRotationMode;
+
+
+    // --------------------------------------------------------
+    // REAR-WHEEL-DRIVE TARGETS
+    // Front targets are forced to zero because RF/LF are disabled.
+    // --------------------------------------------------------
+
+    targetRF_RPM = 0.0;
+    targetLF_RPM = 0.0;
+    targetLR_RPM = leftRPM;
+    targetRR_RPM = rightRPM;
+
+    // Reset integrators only on start-from-stop or direction flip, so small
+    // changes in a streaming cmd_vel don't throw away the integral term.
+    if (wasStopped || directionFlip)
+        resetAllWheelPID();
+
+
+    // --------------------------------------------------------
+    // APPLY ONLY IF SOMETHING CHANGED
+    // --------------------------------------------------------
+
+    if (targetChanged || rotationChanged || wasManual)
+    {
+        // Feed-forward immediately so there is no startup delay; the PID
+        // loop takes over at its next 20 Hz tick.
+        updateWheelPWM();
+        applyLowSpeedTorqueSupport();
+        applyMotorOutputs();
+
+        Serial.print("CMDVEL,");
+        Serial.print(v, 4);
+        Serial.print(",");
+        Serial.print(w, 4);
+        Serial.print(",");
+        Serial.print(targetRF_RPM, 3);
+        Serial.print(",");
+        Serial.print(targetLF_RPM, 3);
+        Serial.print(",");
+        Serial.print(targetLR_RPM, 3);
+        Serial.print(",");
+        Serial.println(targetRR_RPM, 3);
+    }
+}
+
+
+// ============================================================================
+// STOP
+// ============================================================================
+
+void emergencyStop()
+{
+    manualStop = true;
+    manualPWMMode = false;
+    rotationMode = false;
+    rotationBoostUntil = 0;
+
+    currentV = 0;
+    currentW = 0;
+
+    targetRF_RPM = 0;
+    targetLF_RPM = 0;
+    targetLR_RPM = 0;
+    targetRR_RPM = 0;
+
+    desiredPWM_RF = 0;
+    desiredPWM_LF = 0;
+    desiredPWM_LR = 0;
+    desiredPWM_RR = 0;
+
+    clearMeasuredVelocities();
+    resetAllWheelPID();
+    initializePIDMeasurement();
+
+    brakeAllMotors();
+
+    Serial.println("STOP");
+}
+
+
+// ============================================================================
+// RESET
+// ============================================================================
+
+void resetSystem()
+{
+    manualStop = false;
+    manualPWMMode = false;
+    rotationMode = false;
+    rotationBoostUntil = 0;
+
+    currentV = 0;
+    currentW = 0;
+
+    targetRF_RPM = 0;
+    targetLF_RPM = 0;
+    targetLR_RPM = 0;
+    targetRR_RPM = 0;
+
+    desiredPWM_RF = 0;
+    desiredPWM_LF = 0;
+    desiredPWM_LR = 0;
+    desiredPWM_RR = 0;
+
+    clearMeasuredVelocities();
+    resetAllWheelPID();
+
+    brakeAllMotors();
+
+    resetEncoders();
+    initializePIDMeasurement();
+
+    lastCmdTime = millis();
+
+    Serial.println("RESET OK");
+}
+
+
+// ============================================================================
+// INFO
+// ============================================================================
+
+void sendInfoLine()
+{
+    Serial.print("INFO,CPR=");
+    Serial.print(ENCODER_CPR, 1);
+
+    Serial.print(",GEAR=");
+    Serial.print(GEAR_RATIO, 2);
+
+    Serial.print(",WHEELCIRC=");
+    Serial.print(WHEEL_CIRC, 4);
+
+    Serial.print(",TRACK=");
+    Serial.print(TRACK_WIDTH, 4);
+
+    Serial.print(",MAXRPM=");
+    Serial.print(MAX_WHEEL_RPM, 2);
+
+    Serial.print(",LOWSPEEDPWM=");
+    Serial.print(LOW_SPEED_PWM_FLOOR);
+
+    Serial.print(",ROTSTARTPWM=");
+    Serial.print(ROTATION_START_PWM);
+
+    Serial.print(",MAXPWM=");
+    Serial.print(MAX_PWM);
+
+    Serial.print(",MINPWM=");
+    Serial.print(MIN_PWM);
+
+    Serial.print(",WATCHDOG=");
+    Serial.println(CMD_TIMEOUT_MS);
+}
+
+
+// ============================================================================
+// TELEMETRY
+// ============================================================================
+// Encoder values are ALREADY logically signed here.
+// DO NOT apply encoder sign correction again in Python.
+
+void sendTelemetry()
+{
+    static unsigned long lastTelemetry = 0;
+
+    unsigned long now = millis();
+
+    if (now - lastTelemetry < TELEMETRY_INTERVAL_MS)
+        return;
+
+    lastTelemetry = now;
+
+    Serial.print("D,");
+    Serial.print(now);
+
+    Serial.print(",");
+    // ONLY REAR ENCODER COUNTS ARE TELEMETRIED.
+    Serial.print(readLREncoder());
+
+    Serial.print(",");
+    Serial.print(readRREncoder());
+
+    Serial.print(",");
+    Serial.print(imuYaw, 2);
+
+    Serial.print(",");
+    Serial.print(imuPitch, 2);
+
+    Serial.print(",");
+    Serial.print(imuRoll, 2);
+
+    Serial.print(",");
+    Serial.print(gyroX, 4);
+
+    Serial.print(",");
+    Serial.print(gyroY, 4);
+
+    Serial.print(",");
+    Serial.print(gyroZ, 4);
+
+    Serial.print(",");
+    Serial.print(accelX, 4);
+
+    Serial.print(",");
+    Serial.print(accelY, 4);
+
+    Serial.print(",");
+    Serial.println(accelZ, 4);
+}
+
+
+// ============================================================================
+// COMMAND BUFFER
+// ============================================================================
+
+const uint8_t CMD_SIZE = 48;
+
+char usbBuffer[CMD_SIZE];
+char serial3Buffer[CMD_SIZE];
+
+uint8_t usbIndex = 0;
+uint8_t serial3Index = 0;
+
+bool usbOverflow = false;
+bool serial3Overflow = false;
+
+
+// Strict float parse: whole token must be a valid number.
+bool parseFloatStrict(const char *s, float &out)
+{
+    char *end = NULL;
+
+    double d = strtod(s, &end);
+
+    if (end == s || *end != '\0')
+        return false;
+
+    out = (float)d;
+
+    return isfinite(out);
+}
+
+
+// ============================================================================
+// PROCESS COMMAND
+// ============================================================================
+//
+// Supported:
+//     V <v> <w>
+//     M RF LF LR RR      (raw PWM; RF/LF values accepted but ignored)
+//     STOP | S
+//     RESET
+//     INFO
+//     PING
+//
+// ============================================================================
+
+void processCommand(char *cmd)
+{
+    // Remove leading spaces
+    while (*cmd == ' ' || *cmd == '\t')
+        cmd++;
+
+    // Remove trailing whitespace
+    int len = strlen(cmd);
+
+    while (
+        len > 0 &&
+        (
+            cmd[len - 1] == ' '  ||
+            cmd[len - 1] == '\t' ||
+            cmd[len - 1] == '\r' ||
+            cmd[len - 1] == '\n'
+        )
+    )
+    {
+        cmd[len - 1] = '\0';
+        len--;
+    }
+
+    if (*cmd == '\0')
+        return;
+
+
+    // STOP
+    if (strcasecmp(cmd, "S") == 0 || strcasecmp(cmd, "STOP") == 0)
+    {
+        emergencyStop();
+        return;
+    }
+
+    // RESET
+    if (strcasecmp(cmd, "RESET") == 0)
+    {
+        resetSystem();
+        return;
+    }
+
+    // INFO
+    if (strcasecmp(cmd, "INFO") == 0)
+    {
+        sendInfoLine();
+        return;
+    }
+
+    // PING
+    if (strcasecmp(cmd, "PING") == 0)
+    {
+        Serial.println("PONG");
+        return;
+    }
+
+    // MANUAL STOP
+    if (manualStop)
+    {
+        Serial.println("MANUAL STOP ACTIVE");
+        return;
+    }
+
+
+    // --------------------------------------------------------
+    // CMD_VEL:  V <linear> <angular>
+    // --------------------------------------------------------
+
+    if (cmd[0] == 'V' || cmd[0] == 'v')
+    {
+        char *args = cmd + 1;
+
+        while (*args == ' ' || *args == '\t')
+            args++;
+
+        char *vToken = strtok(args, " \t");
+        char *wToken = strtok(NULL, " \t");
+
+        if (vToken == NULL || wToken == NULL)
+        {
+            Serial.println("ERR V NEEDS 2 VALUES");
+            return;
+        }
+
+        float v;
+        float w;
+
+        if (!parseFloatStrict(vToken, v) || !parseFloatStrict(wToken, w))
+        {
+            Serial.println("ERR V INVALID VALUES");
+            return;
+        }
+
+        setCmdVel(v, w);
+
+        return;
+    }
+
+
+    // --------------------------------------------------------
+    // OLD M COMMAND:  M RF LF LR RR   (raw PWM)
+    // --------------------------------------------------------
+
+    if (cmd[0] == 'M' || cmd[0] == 'm')
+    {
+        int rf;
+        int lf;
+        int lr;
+        int rr;
+
+        int parsed = sscanf(cmd + 1, "%d %d %d %d", &rf, &lf, &lr, &rr);
+
+        if (parsed != 4)
+        {
+            Serial.println("ERR M NEEDS 4 VALUES");
+            return;
+        }
+
+        rf = constrain(rf, -MAX_PWM, MAX_PWM);
+        lf = constrain(lf, -MAX_PWM, MAX_PWM);
+        lr = constrain(lr, -MAX_PWM, MAX_PWM);
+        rr = constrain(rr, -MAX_PWM, MAX_PWM);
+
+        manualPWMMode = true;
+        rotationMode = false;
+        rotationBoostUntil = 0;
+
+        // RF/LF values are accepted for protocol compatibility but ignored.
+        // Front motors remain permanently braked.
+        desiredPWM_RF = 0;
+        desiredPWM_LF = 0;
+        desiredPWM_LR = lr;
+        desiredPWM_RR = rr;
+
+        applyMotorOutputs();
+
+        lastCmdTime = millis();
+
+        return;
+    }
+
+
+    Serial.println("INVALID");
+}
+
+
+// ============================================================================
+// SERIAL READER
+// ============================================================================
+
+void readPort(
+    Stream &port,
+    char *buffer,
+    uint8_t &index,
+    bool &overflow
+)
+{
+    while (port.available())
+    {
+        char c = (char)port.read();
+
+        // COMMAND END
+        if (c == '\n' || c == '\r')
+        {
+            if (overflow)
+            {
+                // Discard the whole over-long line, including its tail.
+                overflow = false;
+                index = 0;
+
+                Serial.println("ERR CMD TOO LONG");
+
+                continue;
+            }
+
+            if (index > 0)
+            {
+                buffer[index] = '\0';
+
+                processCommand(buffer);
+
+                index = 0;
+            }
+
+            continue;
+        }
+
+        // PRINTABLE CHARACTER
+        if (c >= 32 && c <= 126)
+        {
+            if (overflow)
+                continue;
+
+            if (index < CMD_SIZE - 1)
+            {
+                buffer[index++] = c;
+            }
+            else
+            {
+                overflow = true;
+            }
+        }
+    }
+}
+
+
+// ============================================================================
+// SETUP
+// ============================================================================
+
+void setup()
+{
+    Serial.begin(115200);
+    Serial3.begin(9600);
+
+    setupMotors();
+
+    setupEncoders();
+    resetEncoders();
+    initializePIDMeasurement();
+
+    Wire.begin();
+    Wire.setClock(I2C_CLOCK_HZ);
+
+    imuOK = bno.begin();
+
+    if (imuOK)
+    {
+        delay(1000);
+
+        bno.setExtCrystalUse(true);
+
+        readIMU();
+
+        lastIMUUpdate = millis();
+    }
+
+    lastCmdTime = millis();
+
+    Serial.println(imuOK ? "BNO055 OK" : "BNO055 ERROR");
+
+    sendInfoLine();
+
+    Serial.println("READY");
+}
+
+
+// ============================================================================
+// MAIN LOOP
+// ============================================================================
+
+void loop()
+{
+    // 1. RECEIVE COMMANDS
+    readPort(Serial,  usbBuffer,     usbIndex,     usbOverflow);
+    readPort(Serial3, serial3Buffer, serial3Index, serial3Overflow);
+
+    unsigned long now = millis();
+
+
+    // 2. IMU @ 20 Hz
+    if (imuOK && (now - lastIMUUpdate) >= IMU_INTERVAL_MS)
+    {
+        lastIMUUpdate = now;
+
+        readIMU();
+    }
+
+
+    // 3. WATCHDOG
+    bool timedOut = (now - lastCmdTime) > CMD_TIMEOUT_MS;
+
+    if (timedOut)
+    {
+        brakeAllMotors();
+
+        manualPWMMode = false;
+        rotationMode = false;
+        rotationBoostUntil = 0;
+        resetAllWheelPID();
+        clearMeasuredVelocities();
+
+        targetRF_RPM = 0;
+        targetLF_RPM = 0;
+        targetLR_RPM = 0;
+        targetRR_RPM = 0;
+
+        desiredPWM_RF = 0;
+        desiredPWM_LF = 0;
+        desiredPWM_LR = 0;
+        desiredPWM_RR = 0;
+
+        // PID timing/counts go stale while the loop is not running; force
+        // re-initialisation so the next command doesn't see a huge dt.
+        pidMeasurementInitialized = false;
+    }
+
+
+    // 4. CLOSED-LOOP WHEEL VELOCITY PID @ 20 Hz
+    if (!timedOut)
+    {
+        updateWheelVelocityControl();
+    }
+
+
+    // 5. TELEMETRY @ 50 Hz
+    sendTelemetry();
+}
