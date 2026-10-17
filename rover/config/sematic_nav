@@ -1,0 +1,31 @@
+# semantic_locations.yaml
+locations:
+  door_1:
+    x: -0.4353
+    y: 0.8139
+    yaw: 3.1467  # Derived from quaternion (z: 0.9999, w: 0.0025)
+
+  table_front:
+    x: 4.5732
+    y: -1.4263
+    yaw: 3.1843  # Derived from quaternion (z: -0.9997, w: 0.0213)
+
+  table_right:
+    x: 2.1757
+    y: -2.4128
+    yaw: 1.5358  # Derived from quaternion (z: 0.6940, w: 0.7199)
+
+  table_back:
+    x: 0.1957
+    y: -1.3741
+    yaw: -0.0328 # Derived from quaternion (z: -0.0163, w: 0.9998)
+
+  table_left:
+    x: 2.2370
+    y: 0.0372
+    yaw: -1.5917 # Derived from quaternion (z: -0.7138, w: 0.7002)
+
+  charging_station:
+    x: 0.3717
+    y: -2.3550
+    yaw: 0.0326  # Derived from quaternion (z: 0.9998, w: 0.0162)
