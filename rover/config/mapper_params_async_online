@@ -1,0 +1,67 @@
+async_slam_toolbox_node:
+  ros__parameters:
+
+    # Plugin / Solver Settings
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner: SCHUR_JACOBI
+    ceres_trust_strategy: LEVENBERG_MARQUARDT
+
+    # Frame Names & Topics
+    odom_frame: odom
+    map_frame: map
+    base_frame: base_link
+    scan_topic: /scan
+    use_odom: false
+    use_imu: True
+
+    # Mode
+    mode: mapping
+
+    # RPLIDAR A1 & Laser Settings
+    max_laser_range: 10.0
+    minimum_time_interval: 0.05
+    transform_timeout: 1.0
+    tf_buffer_duration: 30.0
+    transform_publish_period: 0.05
+    
+    # Mapping Resolution (meters per pixel)
+    resolution: 0.05
+
+    # Correlation / Scan Matching Parameters
+    stack_metrics: false
+    map_update_interval: 2.0
+    scan_buffer_size: 10
+    scan_buffer_maximum_scan_distance: 10.0
+    link_match_minimum_response_fine: 0.3
+    link_scan_maximum_distance: 1.0
+    loop_search_maximum_distance: 3.0
+    do_loop_closing: true
+    loop_match_minimum_chain_size: 10
+    loop_match_maximum_variance_coarse: 3.0
+    loop_match_minimum_response_coarse: 0.35
+    loop_match_minimum_response_fine: 0.45
+
+    transform_tolerance: 0.2
+    # Correlation Parameters
+    correlation_search_space_dimension: 0.5
+    correlation_search_space_resolution: 0.01
+    correlation_search_space_smear_deviation: 0.1
+
+    # Occupancy Grid Parameters
+    minimum_travel_distance: 0.05
+    minimum_travel_heading: 0.05
+    scan_queue_size: 20
+    coarse_search_angle_offset: 0.349
+    coarse_angle_resolution: 0.0349
+        # Correlation Parameters
+    search_window_size: 0.3
+    fine_search_angle_offset: 0.003
+    coarse_search_angle_offset: 0.314
+    coarse_angle_resolution: 0.034
+    minimum_angle_penalty: 0.9
+    minimum_distance_penalty: 0.5
+
+    # Matcher Quality & Thresholds
+    link_match_minimum_response_fine: 0.1  # Keep this sensitive so it locks tightly
+    link_scan_maximum_distance: 1.5
