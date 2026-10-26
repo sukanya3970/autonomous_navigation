@@ -1,4 +1,4 @@
-# autonomous_navigation
+
 # Autonomous Rover Navigation Using ROS 2 Nav2
 
 ## Project Description
